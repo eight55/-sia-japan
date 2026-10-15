@@ -35,7 +35,7 @@ def main():
         except Exception as e:
             errors[code]=str(e)[:160]; print('FAILED',code,errors[code])
     if not rows: raise SystemExit('取得全件失敗。架空の株価には切り替えません。')
-    data=json.dumps({'updated':datetime.now(timezone.utc).isoformat(),'rows':rows,'errors':errors},ensure_ascii=False,allow_nan=False).replace('</','<\\/')
+    data=json.dumps({'updated':datetime.now(timezone.utc).isoformat(),'rows':rows,'errors':errors,'price_dates':sorted(set(r['date'] for r in rows))},ensure_ascii=False,allow_nan=False).replace('</','<\\/')
     template=Path(__file__).with_name('template.html').read_text(encoding='utf-8')
     out=Path('site');out.mkdir(exist_ok=True)
     (out/'index.html').write_text(template.replace('/*SIA_DATA*/','const SIA_DATA='+data+';'),encoding='utf-8')
