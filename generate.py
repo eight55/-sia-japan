@@ -1,10 +1,29 @@
-import json, math, os
+import json, math, os, csv, re
 from pathlib import Path
 from datetime import datetime, timezone
 import pandas as pd
 import yfinance as yf
 
-WATCH = {'7203.T': 'トヨタ自動車', '6758.T': 'ソニーグループ', '8306.T': '三菱UFJ FG', '6501.T': '日立製作所', '8035.T': '東京エレクトロン', '9984.T': 'ソフトバンクグループ', '6861.T': 'キーエンス', '7974.T': '任天堂', '8058.T': '三菱商事', '6098.T': 'リクルートHD', '9432.T': 'NTT', '4063.T': '信越化学工業', '4502.T': '武田薬品工業', '8766.T': '東京海上HD', '7011.T': '三菱重工業', '2914.T': '日本たばこ産業', '3382.T': 'セブン＆アイHD', '8267.T': 'イオン', '9843.T': 'ニトリHD', '4452.T': '花王', '4911.T': '資生堂', '2502.T': 'アサヒグループHD', '2503.T': 'キリンHD', '2802.T': '味の素', '2269.T': '明治HD', '2282.T': '日本ハム', '2002.T': '日清製粉グループ', '9020.T': 'JR東日本', '9021.T': 'JR西日本', '9022.T': 'JR東海', '9005.T': '東急', '9101.T': '日本郵船', '9104.T': '商船三井', '9107.T': '川崎汽船', '9202.T': 'ANA HD', '9201.T': '日本航空', '7201.T': '日産自動車', '7267.T': 'ホンダ', '7269.T': 'スズキ', '7270.T': 'SUBARU', '7202.T': 'いすゞ自動車', '6902.T': 'デンソー', '7259.T': 'アイシン', '6594.T': 'ニデック', '6981.T': '村田製作所', '6762.T': 'TDK', '6971.T': '京セラ', '6503.T': '三菱電機', '6504.T': '富士電機', '6702.T': '富士通', '6701.T': 'NEC', '7751.T': 'キヤノン', '7733.T': 'オリンパス', '7741.T': 'HOYA', '4543.T': 'テルモ', '4519.T': '中外製薬', '4568.T': '第一三共', '4503.T': 'アステラス製薬', '4507.T': '塩野義製薬', '4523.T': 'エーザイ', '4151.T': '協和キリン', '3407.T': '旭化成', '3402.T': '東レ', '4005.T': '住友化学', '4188.T': '三菱ケミカルグループ', '6988.T': '日東電工', '4901.T': '富士フイルムHD', '5802.T': '住友電気工業', '5803.T': 'フジクラ', '5401.T': '日本製鉄', '5411.T': 'JFE HD', '5713.T': '住友金属鉱山', '5020.T': 'ENEOS HD', '1605.T': 'INPEX', '5019.T': '出光興産', '8031.T': '三井物産', '8001.T': '伊藤忠商事', '8002.T': '丸紅', '8053.T': '住友商事', '8308.T': 'りそなHD', '8316.T': '三井住友FG', '8411.T': 'みずほFG', '8591.T': 'オリックス', '8604.T': '野村HD', '8601.T': '大和証券グループ', '8750.T': '第一生命HD', '8725.T': 'MS&AD', '8630.T': 'SOMPO HD', '9433.T': 'KDDI', '9434.T': 'ソフトバンク', '4689.T': 'LINEヤフー', '4755.T': '楽天グループ', '9983.T': 'ファーストリテイリング', '7970.T': '信越ポリマー', '6367.T': 'ダイキン工業', '6301.T': 'コマツ', '6305.T': '日立建機', '7012.T': '川崎重工業', '7013.T': 'IHI', '1801.T': '大成建設'}
+def load_watch(path='stocks.csv'):
+    watch = {}
+    with Path(path).open(encoding='utf-8-sig', newline='') as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames or not {'code', 'name'}.issubset(reader.fieldnames):
+            raise ValueError('stocks.csvにはcode,name列が必要です')
+        for line, row in enumerate(reader, 2):
+            code = (row.get('code') or '').strip().upper()
+            name = (row.get('name') or '').strip()
+            if not code and not name:
+                continue
+            if not re.fullmatch(r'[0-9A-Z]{4,5}\.T', code) or not name:
+                raise ValueError(f'stocks.csv {line}行目: 証券コードまたは銘柄名が不正です')
+            if code in watch:
+                raise ValueError(f'stocks.csv {line}行目: 重複コード {code}')
+            watch[code] = name
+    if not watch:
+        raise ValueError('stocks.csvに分析対象がありません')
+    return watch
+
 def finite(v):
     try:
         v=float(v)
@@ -28,8 +47,10 @@ def collect(code,name):
     return {'code':code,'name':name,'date':str(df.index[-1].date()),'price':finite(price),'change':finite((price/float(c.iloc[-2])-1)*100),'rsi':rv,'macd':finite(macd.iloc[-1]),'ma20':finite(ma20),'ma60':finite(ma60),'volumeRatio':finite(ratio),'atr':finite(a),'entry':finite(entry),'target':finite(entry+3*a),'stop':finite(entry-2*a),'scores':scores,'history':[{'date':str(t.date()),'close':finite(row.Close)} for t,row in df.tail(90).iterrows()]}
 
 def main():
+    watch = load_watch(Path(__file__).with_name('stocks.csv'))
+    print('Configured stocks:', len(watch))
     rows=[]; errors={}
-    for code,name in WATCH.items():
+    for code,name in watch.items():
         try:
             rows.append(collect(code,name)); print('OK',code)
         except Exception as e:
