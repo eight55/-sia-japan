@@ -1,8 +1,10 @@
-import json, math, os, csv, re
+import json, math, os
 from pathlib import Path
 from datetime import datetime, timezone
 import pandas as pd
 import yfinance as yf
+
+import csv, re
 
 def load_watch(path='stocks.csv'):
     watch = {}
@@ -13,15 +15,12 @@ def load_watch(path='stocks.csv'):
         for line, row in enumerate(reader, 2):
             code = (row.get('code') or '').strip().upper()
             name = (row.get('name') or '').strip()
-            if not code and not name:
-                continue
+            if not code and not name: continue
             if not re.fullmatch(r'[0-9A-Z]{4,5}\.T', code) or not name:
                 raise ValueError(f'stocks.csv {line}行目: 証券コードまたは銘柄名が不正です')
-            if code in watch:
-                raise ValueError(f'stocks.csv {line}行目: 重複コード {code}')
+            if code in watch: raise ValueError(f'stocks.csv {line}行目: 重複コード {code}')
             watch[code] = name
-    if not watch:
-        raise ValueError('stocks.csvに分析対象がありません')
+    if not watch: raise ValueError('stocks.csvに分析対象がありません')
     return watch
 
 def finite(v):
@@ -44,21 +43,41 @@ def collect(code,name):
     mom=float(price/c.iloc[-21]-1); year=float(price/c.iloc[0]-1); rv=finite(rsi.iloc[-1]); rv=rv if rv is not None else 50
     scores={'短期':round(max(0,min(100,50+12*(price>ma20)+9*(rv>50)+7*min(ratio,2)+90*mom-15*(rv>75)))), '中期':round(max(0,min(100,48+15*(price>ma60)+13*(ma20>ma60)+110*mom+8*(macd.iloc[-1]>signal.iloc[-1])))), '長期':round(max(0,min(100,45+12*(price>ma60)+9*(ma20>ma60)+28*year)))}
     a=finite(atr) or price*.025; entry=price-.5*a
-    return {'code':code,'name':name,'date':str(df.index[-1].date()),'price':finite(price),'change':finite((price/float(c.iloc[-2])-1)*100),'rsi':rv,'macd':finite(macd.iloc[-1]),'ma20':finite(ma20),'ma60':finite(ma60),'volumeRatio':finite(ratio),'atr':finite(a),'entry':finite(entry),'target':finite(entry+3*a),'stop':finite(entry-2*a),'scores':scores,'history':[{'date':str(t.date()),'close':finite(row.Close)} for t,row in df.tail(90).iterrows()]}
+    return {'code':code,'name':name,'per':None,'pbr':None,'fundamental_updated':None,'date':str(df.index[-1].date()),'price':finite(price),'change':finite((price/float(c.iloc[-2])-1)*100),'rsi':rv,'macd':finite(macd.iloc[-1]),'ma20':finite(ma20),'ma60':finite(ma60),'volumeRatio':finite(ratio),'atr':finite(a),'entry':finite(entry),'target':finite(entry+3*a),'stop':finite(entry-2*a),'scores':scores,'history':[{'date':str(t.date()),'close':finite(row.Close)} for t,row in df.tail(90).iterrows()]}
 
 def main():
-    watch = load_watch(Path(__file__).with_name('stocks.csv'))
-    print('Configured stocks:', len(watch))
     rows=[]; errors={}
-    for code,name in watch.items():
+    for code,name in load_watch(Path(__file__).with_name('stocks.csv')).items():
         try:
             rows.append(collect(code,name)); print('OK',code)
         except Exception as e:
             errors[code]=str(e)[:160]; print('FAILED',code,errors[code])
+    # Only retrieve fundamentals for the union of TOP 5 recommendations (up to 15).
+    # Avoid 500 serial metadata requests and rate-limit risk.
+    selected_codes = {r['code'] for p in ('短期','中期','長期') for r in sorted(rows, key=lambda r:r['scores'][p], reverse=True)[:5]}
+    for row in rows:
+        if row['code'] not in selected_codes: continue
+        try:
+            info = yf.Ticker(row['code']).get_info()
+            per = finite(info.get('trailingPE'))
+            pbr = finite(info.get('priceToBook'))
+            row['per'] = per if per is not None and per > 0 else None
+            row['pbr'] = pbr if pbr is not None and pbr > 0 else None
+            if row['per'] is not None or row['pbr'] is not None:
+                row['fundamental_updated'] = datetime.now(timezone.utc).isoformat()
+        except Exception as exc:
+            print('FUNDAMENTALS UNAVAILABLE', row['code'], str(exc)[:100])
     if not rows: raise SystemExit('取得全件失敗。架空の株価には切り替えません。')
     data=json.dumps({'updated':datetime.now(timezone.utc).isoformat(),'rows':rows,'errors':errors,'price_dates':sorted(set(r['date'] for r in rows))},ensure_ascii=False,allow_nan=False).replace('</','<\\/')
     template=Path(__file__).with_name('template.html').read_text(encoding='utf-8')
     out=Path('site');out.mkdir(exist_ok=True)
     (out/'index.html').write_text(template.replace('/*SIA_DATA*/','const SIA_DATA='+data+';'),encoding='utf-8')
-    print('Generated',out/'index.html',len(rows),'stocks; failed:',len(errors))
+    import csv
+    with (out/'recommendations.csv').open('w',encoding='utf-8-sig',newline='') as f:
+        writer=csv.writer(f)
+        writer.writerow(['run_utc','price_date','period','rank','code','name','price','score','entry','target','stop','per','pbr','fundamental_updated'])
+        for p in ('短期','中期','長期'):
+            for rank,r in enumerate(sorted(rows,key=lambda r:r['scores'][p],reverse=True)[:5],1):
+                writer.writerow([datetime.now(timezone.utc).isoformat(),r['date'],p,rank,r['code'],r['name'],r['price'],r['scores'][p],r['entry'],r['target'],r['stop'],r['per'],r['pbr'],r['fundamental_updated']])
+    print('Generated', out/'index.html',len(rows),'stocks; failed:',len(errors))
 if __name__=='__main__':main()
