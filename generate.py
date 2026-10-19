@@ -1,6 +1,6 @@
 import json, math, os
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import pandas as pd
 import yfinance as yf
 
@@ -44,7 +44,7 @@ def collect(code,name):
     mom=float(price/c.iloc[-21]-1); year=float(price/c.iloc[0]-1); rv=finite(rsi.iloc[-1]); rv=rv if rv is not None else 50
     scores={'短期':round(max(0,min(100,50+12*(price>ma20)+9*(rv>50)+7*min(ratio,2)+90*mom-15*(rv>75)))), '中期':round(max(0,min(100,48+15*(price>ma60)+13*(ma20>ma60)+110*mom+8*(macd.iloc[-1]>signal.iloc[-1])))), '長期':round(max(0,min(100,45+12*(price>ma60)+9*(ma20>ma60)+28*year)))}
     a=finite(atr) or price*.025; entry=price-.5*a
-    return {'code':code,'name':name,'per':None,'pbr':None,'roe':None,'dividendYield':None,'revenueGrowth':None,'earningsGrowth':None,'earningsDate':None,'fundamentalScore':None,'opportunity':None,'assetType':'ETF' if code=='2644.T' else '株式','fundamental_status':'未取得','fundamental_updated':None,'date':str(df.index[-1].date()),'price':finite(price),'change':finite((price/float(c.iloc[-2])-1)*100),'rsi':rv,'macd':finite(macd.iloc[-1]),'ma20':finite(ma20),'ma60':finite(ma60),'volumeRatio':finite(ratio),'atr':finite(a),'entry':finite(entry),'target':finite(entry+3*a),'stop':finite(entry-2*a),'scores':scores,'history':[{'date':str(t.date()),'close':finite(row.Close)} for t,row in df.tail(90).iterrows()]}
+    return {'code':code,'name':name,'per':None,'pbr':None,'roe':None,'dividendYield':None,'revenueGrowth':None,'earningsGrowth':None,'earningsDate':None,'fundamentalScore':None,'valueScore':None,'growthScore':None,'opportunity':None,'compositeScores':{'短期':None,'中期':None,'長期':None},'assetType':'ETF' if code=='2644.T' else '株式','fundamental_status':'未取得','fundamental_updated':None,'date':str(df.index[-1].date()),'price':finite(price),'change':finite((price/float(c.iloc[-2])-1)*100),'rsi':rv,'macd':finite(macd.iloc[-1]),'ma20':finite(ma20),'ma60':finite(ma60),'volumeRatio':finite(ratio),'atr':finite(a),'entry':finite(entry),'target':finite(entry+3*a),'stop':finite(entry-2*a),'scores':scores,'history':[{'date':str(t.date()),'close':finite(row.Close)} for t,row in df.tail(90).iterrows()]}
 
 def main():
     watch=load_watch(Path(__file__).with_name('stocks.csv'))
@@ -60,40 +60,73 @@ def main():
                 errors[code]=str(exc)[:160]; print('FAILED',code,errors[code],flush=True)
     order={code:i for i,code in enumerate(watch)}
     rows.sort(key=lambda r:order[r['code']])
+    # Independent candidate paths: technical leaders plus a rotating fundamental coverage pool.
+    # Cache is a repository-side JSON file; the workflow must persist it between runs.
+    cache_path=Path(__file__).with_name('fundamentals-cache.json')
+    try:
+        cache=json.loads(cache_path.read_text(encoding='utf-8')) if cache_path.exists() else {}
+        if not isinstance(cache,dict):cache={}
+    except (ValueError,OSError):cache={}
     priority={'2644.T','5586.T','6748.T'}
-    candidates=priority|{r['code'] for term in ('短期','中期','長期') for r in sorted(rows,key=lambda r:r['scores'][term],reverse=True)[:10]}
+    technical={r['code'] for term in ('短期','中期','長期') for r in sorted(rows,key=lambda r:r['scores'][term],reverse=True)[:20]}
+    # Round-robin coverage eventually makes all equities eligible for fundamental selection.
+    # Oldest/missing cache records are fetched first; daily request budget is bounded.
+    now=datetime.now(timezone.utc)
+    def age(code):
+        try:return datetime.fromisoformat(cache[code]['fundamental_updated'])
+        except (KeyError,TypeError,ValueError):return datetime.min.replace(tzinfo=timezone.utc)
+    due=sorted((r['code'] for r in rows if r['code']!='2644.T'),key=lambda c:(age(c),order[c]))
+    refresh=set(due[:45]) | priority | technical
+    fields=('per','pbr','roe','dividendYield','revenueGrowth','earningsGrowth','earningsDate','fundamentalScore','valueScore','growthScore','assetType','fundamental_status','fundamental_updated')
     for row in rows:
-        if row['code'] not in candidates: continue
+        old=cache.get(row['code'])
+        if isinstance(old,dict):
+            for field in fields:
+                if field in old:row[field]=old[field]
+        if row['code'] not in refresh:continue
         try:
             info=yf.Ticker(row['code']).get_info()
-            row['assetType']='ETF' if row['code']=='2644.T' or info.get('quoteType')=='ETF' else '株式'
-            row['fundamental_updated']=datetime.now(timezone.utc).isoformat()
-            if row['assetType']=='ETF':
-                row['fundamental_status']='ETF：企業業績スコア対象外'
-                continue
-            for field,key in [('per','trailingPE'),('pbr','priceToBook'),('roe','returnOnEquity'),('dividendYield','dividendYield'),('revenueGrowth','revenueGrowth'),('earningsGrowth','earningsGrowth')]:
-                v=finite(info.get(key))
-                if field in ('per','pbr') and (v is None or v<=0):v=None
-                row[field]=v
-            ed=info.get('earningsTimestampStart') or info.get('earningsTimestamp')
-            if isinstance(ed,(int,float)) and ed>0:
-                row['earningsDate']=datetime.fromtimestamp(ed,timezone.utc).date().isoformat()
-            vals=[row[k] for k in ('per','pbr','roe','dividendYield','revenueGrowth','earningsGrowth')]
-            row['fundamental_status']='取得済み（一部欠損あり）' if any(v is not None for v in vals) else '企業指標欠損'
-            if sum(v is not None for v in vals)>=3 and row['roe'] is not None and (row['revenueGrowth'] is not None or row['earningsGrowth'] is not None):
-                value=50
-                if row['per'] is not None:value+=max(-12,min(12,(18-row['per'])*1.1))
-                if row['pbr'] is not None:value+=max(-8,min(8,(2-row['pbr'])*4))
-                growth=50+max(-20,min(20,row['roe']*100*.7))
-                for key in ('revenueGrowth','earningsGrowth'):
-                    if row[key] is not None:growth+=max(-15,min(15,row[key]*100*.45))
-                if row['dividendYield'] is not None and 0<row['dividendYield']<.12:growth+=min(5,row['dividendYield']*100)
-                row['fundamentalScore']=max(0,min(100,round(.4*value+.6*growth)))
-                row['opportunity']=round(.45*row['scores']['中期']+.55*row['fundamentalScore'])
-            else:row['fundamental_status']+='・総合評価にはデータ不足'
+            fresh={'assetType':'ETF' if row['code']=='2644.T' or info.get('quoteType')=='ETF' else '株式','fundamental_updated':now.isoformat()}
+            if fresh['assetType']=='ETF':
+                fresh['fundamental_status']='ETF：企業業績スコア対象外'
+            else:
+                for field,key in [('per','trailingPE'),('pbr','priceToBook'),('roe','returnOnEquity'),('dividendYield','dividendYield'),('revenueGrowth','revenueGrowth'),('earningsGrowth','earningsGrowth')]:
+                    v=finite(info.get(key))
+                    if field in ('per','pbr') and (v is None or v<=0):v=None
+                    fresh[field]=v
+                ed=info.get('earningsTimestampStart') or info.get('earningsTimestamp')
+                fresh['earningsDate']=datetime.fromtimestamp(ed,timezone.utc).date().isoformat() if isinstance(ed,(int,float)) and ed>0 else None
+                vals=[fresh[k] for k in ('per','pbr','roe','dividendYield','revenueGrowth','earningsGrowth')]
+                fresh['fundamental_status']='取得済み（一部欠損あり）' if any(v is not None for v in vals) else '企業指標欠損'
+                if sum(v is not None for v in vals)>=3 and fresh['roe'] is not None and (fresh['revenueGrowth'] is not None or fresh['earningsGrowth'] is not None):
+                    value=50
+                    if fresh['per'] is not None:value+=max(-12,min(12,(18-fresh['per'])*1.1))
+                    if fresh['pbr'] is not None:value+=max(-8,min(8,(2-fresh['pbr'])*4))
+                    growth=50+max(-20,min(20,fresh['roe']*100*.7))
+                    for key in ('revenueGrowth','earningsGrowth'):
+                        if fresh[key] is not None:growth+=max(-15,min(15,fresh[key]*100*.45))
+                    if fresh['dividendYield'] is not None and 0<fresh['dividendYield']<.12:growth+=min(5,fresh['dividendYield']*100)
+                    fresh['valueScore']=round(max(0,min(100,value)))
+                    fresh['growthScore']=round(max(0,min(100,growth)))
+                    fresh['fundamentalScore']=round(.4*fresh['valueScore']+.6*fresh['growthScore'])
+                else:
+                    fresh.update(valueScore=None,growthScore=None,fundamentalScore=None)
+                    fresh['fundamental_status']+='・総合評価にはデータ不足'
+            row.update(fresh)
+            cache[row['code']]={k:row.get(k) for k in fields}
         except Exception as exc:
-            row['fundamental_status']='取得失敗'
+            if not old:row['fundamental_status']='取得失敗'
             print('FUNDAMENTALS UNAVAILABLE',row['code'],str(exc)[:100],flush=True)
+    weights={'短期':(.75,.10,.15),'中期':(.45,.25,.30),'長期':(.20,.35,.45)}
+    for row in rows:
+        if row['assetType']=='ETF' or row['valueScore'] is None or row['growthScore'] is None:continue
+        for term,(t,v,g) in weights.items():
+            row['compositeScores'][term]=round(t*row['scores'][term]+v*row['valueScore']+g*row['growthScore'])
+        row['opportunity']=row['compositeScores']['中期']
+    # Export cache as an artifact; persist it to the repository to reuse across Actions runs.
+    out=Path('site');out.mkdir(exist_ok=True)
+    (out/'fundamentals-cache.json').write_text(json.dumps(cache,ensure_ascii=False,indent=2,allow_nan=False),encoding='utf-8')
+    print('Fundamental coverage:',sum(r['compositeScores']['中期'] is not None for r in rows),'of',len(rows),flush=True)
     if not rows: raise SystemExit('取得全件失敗。架空の株価には切り替えません。')
     data=json.dumps({'updated':datetime.now(timezone.utc).isoformat(),'rows':rows,'errors':errors,'price_dates':sorted(set(r['date'] for r in rows)),'configured_count':len(watch)},ensure_ascii=False,allow_nan=False).replace('</','<\\/')
     template=Path(__file__).with_name('template.html').read_text(encoding='utf-8')
@@ -106,5 +139,12 @@ def main():
         for p in ('短期','中期','長期'):
             for rank,r in enumerate(sorted(rows,key=lambda r:r['scores'][p],reverse=True)[:5],1):
                 writer.writerow([datetime.now(timezone.utc).isoformat(),r['date'],p,rank,r['code'],r['name'],r['price'],r['scores'][p],r['entry'],r['target'],r['stop'],r['per'],r['pbr'],r['fundamental_updated']])
-    print('Generated', out/'index.html',len(rows),'stocks; failed:',len(errors))
+    with (out/'composite-recommendations.csv').open('w',encoding='utf-8-sig',newline='') as f:
+        writer=csv.writer(f)
+        writer.writerow(['run_utc','price_date','period','rank','code','name','price','composite_score','technical_score','value_score','growth_score','fundamental_updated'])
+        for term in ('短期','中期','長期'):
+            eligible=[r for r in rows if r['compositeScores'][term] is not None]
+            for rank,r in enumerate(sorted(eligible,key=lambda r:r['compositeScores'][term],reverse=True)[:5],1):
+                writer.writerow([now.isoformat(),r['date'],term,rank,r['code'],r['name'],r['price'],r['compositeScores'][term],r['scores'][term],r['valueScore'],r['growthScore'],r['fundamental_updated']])
+    print('Generated', out/'index.html' ,len(rows),'stocks; failed:',len(errors))
 if __name__=='__main__':main()
