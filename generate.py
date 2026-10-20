@@ -42,9 +42,13 @@ def collect(code,name):
     tr=pd.concat([df.High-df.Low,(df.High-c.shift()).abs(),(df.Low-c.shift()).abs()],axis=1).max(axis=1); atr=tr.rolling(14).mean().iloc[-1]
     price=float(c.iloc[-1]); ma20=float(c.tail(20).mean()); ma60=float(c.tail(60).mean()); volavg=float(v.tail(20).mean()); ratio=float(v.iloc[-1]/volavg) if volavg>0 else 0
     mom=float(price/c.iloc[-21]-1); year=float(price/c.iloc[0]-1); rv=finite(rsi.iloc[-1]); rv=rv if rv is not None else 50
-    scores={'短期':round(max(0,min(100,50+12*(price>ma20)+9*(rv>50)+7*min(ratio,2)+90*mom-15*(rv>75)))), '中期':round(max(0,min(100,48+15*(price>ma60)+13*(ma20>ma60)+110*mom+8*(macd.iloc[-1]>signal.iloc[-1])))), '長期':round(max(0,min(100,45+12*(price>ma60)+9*(ma20>ma60)+28*year)))}
+    # Keep raw technical signals without clipping; normalize across the actual run universe below.
+    raw_scores={'短期':50+12*(price>ma20)+9*(rv>50)+7*min(ratio,2)+90*mom-15*(rv>75),
+                '中期':48+15*(price>ma60)+13*(ma20>ma60)+110*mom+8*(macd.iloc[-1]>signal.iloc[-1]),
+                '長期':45+12*(price>ma60)+9*(ma20>ma60)+28*year}
+    scores={term:None for term in raw_scores}
     a=finite(atr) or price*.025; entry=price-.5*a
-    return {'code':code,'name':name,'per':None,'pbr':None,'roe':None,'dividendYield':None,'revenueGrowth':None,'earningsGrowth':None,'earningsDate':None,'fundamentalScore':None,'valueScore':None,'growthScore':None,'opportunity':None,'compositeScores':{'短期':None,'中期':None,'長期':None},'assetType':'ETF' if code=='2644.T' else '株式','fundamental_status':'未取得','fundamental_updated':None,'date':str(df.index[-1].date()),'price':finite(price),'change':finite((price/float(c.iloc[-2])-1)*100),'rsi':rv,'macd':finite(macd.iloc[-1]),'ma20':finite(ma20),'ma60':finite(ma60),'volumeRatio':finite(ratio),'atr':finite(a),'entry':finite(entry),'target':finite(entry+3*a),'stop':finite(entry-2*a),'scores':scores,'history':[{'date':str(t.date()),'close':finite(row.Close)} for t,row in df.tail(90).iterrows()]}
+    return {'code':code,'name':name,'per':None,'pbr':None,'roe':None,'dividendYield':None,'revenueGrowth':None,'earningsGrowth':None,'earningsDate':None,'fundamentalScore':None,'valueScore':None,'growthScore':None,'opportunity':None,'compositeScores':{'短期':None,'中期':None,'長期':None},'assetType':'ETF' if code=='2644.T' else '株式','fundamental_status':'未取得','fundamental_updated':None,'date':str(df.index[-1].date()),'price':finite(price),'change':finite((price/float(c.iloc[-2])-1)*100),'rsi':rv,'macd':finite(macd.iloc[-1]),'ma20':finite(ma20),'ma60':finite(ma60),'volumeRatio':finite(ratio),'atr':finite(a),'entry':finite(entry),'target':finite(entry+3*a),'stop':finite(entry-2*a),'scores':scores,'rawScores':raw_scores,'history':[{'date':str(t.date()),'close':finite(row.Close)} for t,row in df.tail(90).iterrows()]}
 
 def main():
     watch=load_watch(Path(__file__).with_name('stocks.csv'))
@@ -60,6 +64,21 @@ def main():
                 errors[code]=str(exc)[:160]; print('FAILED',code,errors[code],flush=True)
     order={code:i for i,code in enumerate(watch)}
     rows.sort(key=lambda r:order[r['code']])
+    # v0.4.1: percentile ranks avoid 100-point saturation. Ties receive the
+    # average rank, so input order never arbitrarily breaks a tie.
+    for term in ('短期','中期','長期'):
+        sorted_values=sorted(r['rawScores'][term] for r in rows)
+        import bisect
+        n=len(sorted_values)
+        for row in rows:
+            x=row['rawScores'][term]
+            lo=bisect.bisect_left(sorted_values,x)
+            hi=bisect.bisect_right(sorted_values,x)
+            percentile=50.0 if n==1 else 100.0*((lo+hi-1)/2)/(n-1)
+            row['scores'][term]=round(percentile,2)
+        print('TECHNICAL DISTRIBUTION',term,'100-point:',
+              sum(r['scores'][term]==100 for r in rows),'of',n,flush=True)
+
     # Independent candidate paths: technical leaders plus a rotating fundamental coverage pool.
     # Cache is a repository-side JSON file; the workflow must persist it between runs.
     cache_path=Path(__file__).with_name('fundamentals-cache.json')
@@ -128,7 +147,7 @@ def main():
     (out/'fundamentals-cache.json').write_text(json.dumps(cache,ensure_ascii=False,indent=2,allow_nan=False),encoding='utf-8')
     print('Fundamental coverage:',sum(r['compositeScores']['中期'] is not None for r in rows),'of',len(rows),flush=True)
     if not rows: raise SystemExit('取得全件失敗。架空の株価には切り替えません。')
-    data=json.dumps({'updated':datetime.now(timezone.utc).isoformat(),'rows':rows,'errors':errors,'price_dates':sorted(set(r['date'] for r in rows)),'configured_count':len(watch)},ensure_ascii=False,allow_nan=False).replace('</','<\\/')
+    data=json.dumps({'score_version':'v0.4.1-percentile','updated':datetime.now(timezone.utc).isoformat(),'rows':rows,'errors':errors,'price_dates':sorted(set(r['date'] for r in rows)),'configured_count':len(watch)},ensure_ascii=False,allow_nan=False).replace('</','<\\/')
     template=Path(__file__).with_name('template.html').read_text(encoding='utf-8')
     out=Path('site');out.mkdir(exist_ok=True)
     (out/'index.html').write_text(template.replace('/*SIA_DATA*/','const SIA_DATA='+data+';'),encoding='utf-8')
