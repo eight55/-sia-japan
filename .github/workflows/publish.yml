@@ -32,11 +32,34 @@ jobs:
 
       - run: pip install -r requirements.txt
 
+      # Restore the latest saved fundamentals from earlier successful runs.
+      # Each run has a unique key because GitHub Actions caches are immutable.
+      - name: Restore fundamentals cache
+        uses: actions/cache/restore@v4
+        with:
+          path: fundamentals-cache.json
+          key: sia-fundamentals-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            sia-fundamentals-${{ github.ref_name }}-
+
       - run: python generate.py
 
-      
+      - name: Prepare fundamentals cache for next run
+        run: cp site/fundamentals-cache.json fundamentals-cache.json
+
+      - name: Save fundamentals cache
+        uses: actions/cache/save@v4
+        with:
+          path: fundamentals-cache.json
+          key: sia-fundamentals-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+
       - uses: actions/upload-artifact@v4
         with:
           name: sia-test-result
-          path: site/index.html
+          path: |
+            site/index.html
+            site/fundamentals-cache.json
+            site/recommendations.csv
+            site/composite-recommendations.csv
+
 
